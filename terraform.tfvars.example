@@ -1,0 +1,69 @@
+# Proxmox Configuration
+proxmox_api_url          = "https://your-proxmox-host:8006/api2/json"
+proxmox_api_token_id     = "terraform@pve!terraform"
+proxmox_api_token_secret = "your-api-token-secret"
+proxmox_node            = "your-proxmox-node"
+
+# SSH Configuration
+ssh_public_key       = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ... your-public-key"
+ssh_private_key_path = "~/.ssh/id_rsa"
+
+# Network Configuration
+bridge_name      = "vmbr1"
+network_gateway  = "192.168.1.1"
+network_cidr     = "24"
+dns_servers      = ["8.8.8.8", "8.8.4.4"]
+metallb_ip_range = "192.168.1.240-192.168.1.250"
+
+# Storage Configuration
+storage_pool = "local-zfs"
+
+# Template Configuration
+template_name = "ubuntu-24.04-server-cloudimg"
+
+# Kubernetes Configuration
+kubernetes_version = "1.29.10"
+
+# Node Configuration (optional - uses defaults if not specified)
+control_plane = {
+  name   = "k8s-cp-01"
+  vmid   = 4001
+  ip     = "192.168.1.101"
+  cores  = 1
+  memory = 2048
+  disk   = "32G"
+}
+
+worker_nodes = [
+  {
+    name   = "k8s-worker-01"
+    vmid   = 4002
+    ip     = "192.168.1.102"
+    cores  = 1
+    memory = 2048
+    disk   = "32G"
+  },
+  {
+    name   = "k8s-worker-02"
+    vmid   = 4003
+    ip     = "192.168.1.103"
+    cores  = 1
+    memory = 2048
+    disk   = "32G"
+  },
+  {
+    name   = "k8s-worker-03"
+    vmid   = 4004
+    ip     = "192.168.1.104"
+    cores  = 1
+    memory = 2048
+    disk   = "32G"
+  }
+]
+
+# Application Passwords
+application_passwords = {
+  argocd_admin    = "your-secure-password"
+  grafana_admin   = "your-secure-password"
+  portainer_admin = "your-secure-password"
+}

@@ -1,0 +1,50 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+!terraform.tfvars.example
+.terraform/
+.terraform.lock.hcl
+terraform.tfplan
+
+# Ansible
+ansible/inventory.yml
+ansible/group_vars/all.yml
+ansible/join_command.txt
+ansible/roles/*/files/*
+ansible/playbooks/temp/
+
+# SSH
+id_rsa*
+known_hosts
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Install Cilium CNI
+  kubernetes.core.helm:
+    name: cilium
+    chart_ref: cilium/cilium
+    release_namespace: kube-system
+    values:
+      operator:
+        replicas: 1
+      hubble:
+        relay:
+          enabled: true
+        ui:
+          enabled: true
+  environment:
+    KUBECONFIG: /home/dev/.kube/config

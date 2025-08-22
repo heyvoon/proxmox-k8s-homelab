@@ -1,0 +1,160 @@
+---
+- name: Install Helm
+  get_url:
+    url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+    dest: /tmp/helm.tar.gz
+    mode: '0644'
+
+- name: Extract Helm
+  unarchive:
+    src: /tmp/helm.tar.gz
+    dest: /tmp
+    remote_src: yes
+
+- name: Install Helm binary
+  copy:
+    src: /tmp/linux-amd64/helm
+    dest: /usr/local/bin/helm
+    mode: '0755'
+    remote_src: yes
+  become: yes
+
+- name: Add Cilium Helm repository
+  kubernetes.core.helm_repository:
+    name: cilium
+    repo_url: https://helm.cilium.io/
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Configure MetalLB L2Advertisement
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: default-l2advertisement
+        namespace: metallb-system
+      spec:
+        ipAddressPools:
+          - default-pool
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Install NGINX Ingress Controller
+  kubernetes.core.helm:
+    name: ingress-nginx
+    chart_ref: ingress-nginx/ingress-nginx
+    release_namespace: ingress-nginx
+    values:
+      controller:
+        service:
+          type: LoadBalancer
+        metrics:
+          enabled: true
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Install ArgoCD
+  kubernetes.core.helm:
+    name: argocd
+    chart_ref: argo/argo-cd
+    release_namespace: argocd
+    values:
+      server:
+        service:
+          type: ClusterIP
+        ingress:
+          enabled: true
+          ingressClassName: nginx
+          hosts:
+            - "argocd.{{ ansible_default_ipv4.address }}.nip.io"
+          tls:
+            - secretName: argocd-server-tls
+              hosts:
+                - "argocd.{{ ansible_default_ipv4.address }}.nip.io"
+      configs:
+        params:
+          server.insecure: true
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Update ArgoCD admin password
+  kubernetes.core.k8s_exec:
+    namespace: argocd
+    pod: "{{ argocd_pod.resources[0].metadata.name }}"
+    command: >
+      argocd admin initial-password -n argocd
+  vars:
+    argocd_pod: "{{ query('kubernetes.core.k8s', api_version='v1', kind='Pod', namespace='argocd', label_selector='app.kubernetes.io/name=argocd-server') }}"
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Install Portainer
+  kubernetes.core.helm:
+    name: portainer
+    chart_ref: portainer/portainer
+    release_namespace: portainer
+    values:
+      service:
+        type: ClusterIP
+      ingress:
+        enabled: true
+        ingressClassName: nginx
+        hosts:
+          - host: "portainer.{{ ansible_default_ipv4.address }}.nip.io"
+            paths:
+              - path: /
+                pathType: Prefix
+        tls:
+          - secretName: portainer-tls
+            hosts:
+              - "portainer.{{ ansible_default_ipv4.address }}.nip.io"
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Install kube-prometheus-stack
+  kubernetes.core.helm:
+    name: kube-prometheus-stack
+    chart_ref: prometheus-community/kube-prometheus-stack
+    release_namespace: monitoring
+    values:
+      grafana:
+        adminPassword: "{{ grafana_admin_password }}"
+        service:
+          type: ClusterIP
+        ingress:
+          enabled: true
+          ingressClassName: nginx
+          hosts:
+            - "grafana.{{ ansible_default_ipv4.address }}.nip.io"
+          tls:
+            - secretName: grafana-tls
+              hosts:
+                - "grafana.{{ ansible_default_ipv4.address }}.nip.io"
+      prometheus:
+        service:
+          type: ClusterIP
+        ingress:
+          enabled: true
+          ingressClassName: nginx
+          hosts:
+            - "prometheus.{{ ansible_default_ipv4.address }}.nip.io"
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Install Loki stack
+  kubernetes.core.helm:
+    name: loki-stack
+    chart_ref: grafana/loki-stack
+    release_namespace: logging
+    values:
+      loki:
+        persistence:
+          enabled: true
+          size: 10Gi
+      promtail:
+        enabled: true
+      grafana:
+        enabled: false
+  environment:
+    KUBECONFIG: /home/dev/.kube/config

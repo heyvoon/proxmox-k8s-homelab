@@ -1,0 +1,28 @@
+---
+- name: Deploy Kubernetes Cluster
+  hosts: all
+  become: yes
+  gather_facts: yes
+  roles:
+    - common
+    - containerd
+    - kubernetes
+
+- name: Initialize Kubernetes Control Plane
+  hosts: masters
+  become: yes
+  roles:
+    - control-plane
+
+- name: Join Worker Nodes
+  hosts: workers
+  become: yes
+  roles:
+    - worker-nodes
+
+- name: Deploy CNI and Applications
+  hosts: masters
+  become: no
+  roles:
+    - cni
+    - applications

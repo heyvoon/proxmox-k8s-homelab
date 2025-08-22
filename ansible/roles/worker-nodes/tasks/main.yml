@@ -1,0 +1,16 @@
+---
+- name: Check if node is already joined
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: node_joined
+
+- name: Read join command from file
+  local_action:
+    module: slurp
+    src: "./join_command.txt"
+  register: join_command_content
+  when: not node_joined.stat.exists
+
+- name: Join worker node to cluster
+  command: "{{ join_command_content.content | b64decode | trim }}"
+  when: not node_joined.stat.exists and join_command_content.content is defined

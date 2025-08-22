@@ -1,0 +1,382 @@
+---
+- name: Create application namespaces
+  kubernetes.core.k8s:
+    name: "{{ item }}"
+    api_version: v1
+    kind: Namespace
+    state: present
+  loop:
+    - metallb-system
+    - ingress-nginx
+    - argocd
+    - portainer
+    - monitoring
+    - logging
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Add Helm repositories
+  kubernetes.core.helm_repository:
+    name: "{{ item.name }}"
+    repo_url: "{{ item.url }}"
+  loop:
+    - { name: 'metallb', url: 'https://metallb.github.io/metallb' }
+    - { name: 'ingress-nginx', url: 'https://kubernetes.github.io/ingress-nginx' }
+    - { name: 'argo', url: 'https://argoproj.github.io/argo-helm' }
+    - { name: 'portainer', url: 'https://portainer.github.io/k8s/' }
+    - { name: 'prometheus-community', url: 'https://prometheus-community.github.io/helm-charts' }
+    - { name: 'grafana', url: 'https://grafana.github.io/helm-charts' }
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+# Install Helm (if not already installed)
+- name: Install Helm
+  get_url:
+    url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+    dest: /tmp/helm.tar.gz
+    mode: '0644'
+
+- name: Extract Helm
+  unarchive:
+    src: /tmp/helm.tar.gz
+    dest: /tmp
+    remote_src: yes
+
+- name: Install Helm binary
+  copy:
+    src: /tmp/linux-amd64/helm
+    dest: /usr/local/bin/helm
+    mode: '0755'
+    remote_src: yes
+  become: yes
+
+# Install MetalLB first (LoadBalancer dependency)
+- name: Install MetalLB
+  kubernetes.core.helm:
+    name: metallb
+    chart_ref: metallb/metallb
+    release_namespace: metallb-system
+    create_namespace: true
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Wait for MetalLB to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: metallb-controller
+    namespace: metallb-system
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Configure MetalLB IP pool
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: default-pool
+        namespace: metallb-system
+      spec:
+        addresses:
+        - "{{ metallb_ip_range }}"
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Configure MetalLB L2Advertisement
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: default-l2advertisement
+        namespace: metallb-system
+      spec:
+        ipAddressPools:
+        - default-pool
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+# Install NGINX Ingress Controller after MetalLB
+- name: Install NGINX Ingress Controller
+  kubernetes.core.helm:
+    name: ingress-nginx
+    chart_ref: ingress-nginx/ingress-nginx
+    release_namespace: ingress-nginx
+    create_namespace: true
+    values:
+      controller:
+        service:
+          type: LoadBalancer
+        metrics:
+          enabled: true
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Wait for NGINX Ingress Controller to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: ingress-nginx-controller
+    namespace: ingress-nginx
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+# Install ArgoCD with proper configuration
+- name: Install ArgoCD
+  kubernetes.core.helm:
+    name: argocd
+    chart_ref: argo/argo-cd
+    release_namespace: argocd
+    create_namespace: true
+    values:
+      server:
+        service:
+          type: ClusterIP
+        ingress:
+          enabled: true
+          ingressClassName: nginx
+          annotations:
+            nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+            nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+          hosts:
+          - "argocd.{{ ansible_default_ipv4.address }}.nip.io"
+          tls:
+          - secretName: argocd-server-tls
+            hosts:
+            - "argocd.{{ ansible_default_ipv4.address }}.nip.io"
+        configs:
+          params:
+            server.insecure: true
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Wait for ArgoCD to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: argocd-server
+    namespace: argocd
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+- name: Get ArgoCD initial admin password
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: argocd-initial-admin-secret
+    namespace: argocd
+  register: argocd_secret
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+  retries: 5
+  delay: 10
+
+- name: Save ArgoCD admin password
+  local_action:
+    module: copy
+    content: "{{ argocd_secret.resources[0].data.password | b64decode }}"
+    dest: "./argocd_admin_password.txt"
+  when: argocd_secret.resources | length > 0
+
+# Install Portainer with correct configuration
+- name: Install Portainer
+  kubernetes.core.helm:
+    name: portainer
+    chart_ref: portainer/portainer
+    release_namespace: portainer
+    create_namespace: true
+    values:
+      service:
+        type: ClusterIP
+      ingress:
+        enabled: true
+        ingressClassName: nginx
+        annotations:
+          nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+        hosts:
+        - host: "portainer.{{ ansible_default_ipv4.address }}.nip.io"
+          paths:
+          - path: /
+            pathType: Prefix
+        tls:
+        - secretName: portainer-tls
+          hosts:
+          - "portainer.{{ ansible_default_ipv4.address }}.nip.io"
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+# Install monitoring stack with proper timeout
+- name: Install kube-prometheus-stack
+  kubernetes.core.helm:
+    name: kube-prometheus-stack
+    chart_ref: prometheus-community/kube-prometheus-stack
+    release_namespace: monitoring
+    create_namespace: true
+    timeout: 900s
+    values:
+      grafana:
+        adminPassword: "{{ grafana_admin_password }}"
+        service:
+          type: ClusterIP
+        ingress:
+          enabled: true
+          ingressClassName: nginx
+          hosts:
+          - "grafana.{{ ansible_default_ipv4.address }}.nip.io"
+          tls:
+          - secretName: grafana-tls
+            hosts:
+            - "grafana.{{ ansible_default_ipv4.address }}.nip.io"
+        persistence:
+          enabled: true
+          size: 10Gi
+      prometheus:
+        prometheusSpec:
+          serviceMonitorSelectorNilUsesHelmValues: false
+          podMonitorSelectorNilUsesHelmValues: false
+          ruleSelectorNilUsesHelmValues: false
+          retention: 30d
+          storageSpec:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: 20Gi
+        service:
+          type: ClusterIP
+        ingress:
+          enabled: true
+          ingressClassName: nginx
+          hosts:
+          - "prometheus.{{ ansible_default_ipv4.address }}.nip.io"
+          tls:
+          - secretName: prometheus-tls
+            hosts:
+            - "prometheus.{{ ansible_default_ipv4.address }}.nip.io"
+      alertmanager:
+        alertmanagerSpec:
+          storage:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: 5Gi
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+# Install Loki with proper configuration
+- name: Install Loki stack
+  kubernetes.core.helm:
+    name: loki-stack
+    chart_ref: grafana/loki-stack
+    release_namespace: logging
+    create_namespace: true
+    values:
+      loki:
+        persistence:
+          enabled: true
+          size: 10Gi
+        config:
+          schema_config:
+            configs:
+            - from: 2020-10-24
+              store: boltdb-shipper
+              object_store: filesystem
+              schema: v11
+              index:
+                prefix: index_
+                period: 24h
+      promtail:
+        enabled: true
+        config:
+          clients:
+          - url: http://loki-stack:3100/loki/api/v1/push
+      grafana:
+        enabled: false
+      fluent-bit:
+        enabled: false
+      logstash:
+        enabled: false
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+# Create Grafana Loki datasource
+- name: Create Grafana Loki datasource
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: loki-datasource
+        namespace: monitoring
+        labels:
+          grafana_datasource: "1"
+      data:
+        loki-datasource.yaml: |
+          apiVersion: 1
+          datasources:
+          - name: Loki
+            type: loki
+            access: proxy
+            url: http://loki-stack.logging.svc.cluster.local:3100
+            isDefault: false
+            jsonData:
+              maxLines: 1000
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+
+# Wait for all applications to be ready
+- name: Wait for all applications to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ item.namespace }}"
+    name: "{{ item.name }}"
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 600
+  loop:
+    - { namespace: "argocd", name: "argocd-server" }
+    - { namespace: "portainer", name: "portainer" }
+    - { namespace: "monitoring", name: "kube-prometheus-stack-grafana" }
+    - { namespace: "monitoring", name: "kube-prometheus-stack-kube-state-metrics" }
+    - { namespace: "logging", name: "loki-stack" }
+  environment:
+    KUBECONFIG: /home/dev/.kube/config
+  ignore_errors: yes
+  retries: 3
+  delay: 30
+
+# Display application URLs
+- name: Display application URLs
+  debug:
+    msg: |
+      ========================================
+      Kubernetes cluster deployment complete!
+      ========================================
+      
+      Access URLs:
+      - ArgoCD: https://argocd.{{ ansible_default_ipv4.address }}.nip.io
+      - Grafana: https://grafana.{{ ansible_default_ipv4.address }}.nip.io (admin/{{ grafana_admin_password }})
+      - Prometheus: https://prometheus.{{ ansible_default_ipv4.address }}.nip.io
+      - Portainer: https://portainer.{{ ansible_default_ipv4.address }}.nip.io
+      
+      Cluster access: ssh -i {{ ansible_ssh_private_key_file }} {{ ansible_user }}@{{ ansible_default_ipv4.address }}
+      
+      ========================================
