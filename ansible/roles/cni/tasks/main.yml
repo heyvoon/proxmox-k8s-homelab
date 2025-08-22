@@ -1,33 +1,107 @@
 ---
-- name: Install Helm
+# Defaults:
+#   helm_version: "3.18.5"
+#   kubeconfig_path: "/etc/kubernetes/admin.conf"
+#   metallb_pool_cidr: "192.168.1.240-192.168.1.250"
+#   grafana_admin_password: "changeme"
+
+- name: "Download Helm v{{ helm_version }}"
   get_url:
     url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
     dest: /tmp/helm.tar.gz
-    mode: '0644'
+    mode: "0644"
+  become: true
 
 - name: Extract Helm
   unarchive:
     src: /tmp/helm.tar.gz
     dest: /tmp
-    remote_src: yes
+    remote_src: true
+  become: true
 
 - name: Install Helm binary
   copy:
     src: /tmp/linux-amd64/helm
     dest: /usr/local/bin/helm
-    mode: '0755'
-    remote_src: yes
-  become: yes
+    mode: "0755"
+    remote_src: true
+  become: true
 
-- name: Add Cilium Helm repository
+# ---- Add required Helm repositories
+- name: Add Cilium repo
   kubernetes.core.helm_repository:
     name: cilium
     repo_url: https://helm.cilium.io/
-  environment:
-    KUBECONFIG: /home/dev/.kube/config
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+
+- name: Add ingress-nginx repo
+  kubernetes.core.helm_repository:
+    name: ingress-nginx
+    repo_url: https://kubernetes.github.io/ingress-nginx
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+  # docs: kubernetes.core.helm_repository supports kubeconfig param. :contentReference[oaicite:0]{index=0}
+
+- name: Add Argo repo
+  kubernetes.core.helm_repository:
+    name: argo
+    repo_url: https://argoproj.github.io/argo-helm
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+
+- name: Add Portainer repo
+  kubernetes.core.helm_repository:
+    name: portainer
+    repo_url: https://portainer.github.io/k8s/
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+
+- name: Add Prometheus Community repo
+  kubernetes.core.helm_repository:
+    name: prometheus-community
+    repo_url: https://prometheus-community.github.io/helm-charts
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+
+- name: Add Grafana repo
+  kubernetes.core.helm_repository:
+    name: grafana
+    repo_url: https://grafana.github.io/helm-charts
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+
+- name: Add MetalLB repo
+  kubernetes.core.helm_repository:
+    name: metallb
+    repo_url: https://metallb.github.io/metallb
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+  # MetalLB official repo / install method. :contentReference[oaicite:1]{index=1}
+
+# ---- MetalLB (install before CRs)
+- name: Install MetalLB
+  kubernetes.core.helm:
+    name: metallb
+    chart_ref: metallb/metallb
+    release_namespace: metallb-system
+    create_namespace: true
+    wait: true
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+  # Helm module also supports kubeconfig param. :contentReference[oaicite:2]{index=2}
+
+- name: Configure MetalLB IPAddressPool
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: default-pool
+        namespace: metallb-system
+      spec:
+        addresses:
+          - "{{ metallb_pool_cidr }}"
+  # kubernetes.core.k8s supports kubeconfig param. :contentReference[oaicite:3]{index=3}
 
 - name: Configure MetalLB L2Advertisement
   kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
     definition:
       apiVersion: metallb.io/v1beta1
       kind: L2Advertisement
@@ -35,30 +109,33 @@
         name: default-l2advertisement
         namespace: metallb-system
       spec:
-        ipAddressPools:
-          - default-pool
-  environment:
-    KUBECONFIG: /home/dev/.kube/config
+        ipAddressPools: [default-pool]
 
-- name: Install NGINX Ingress Controller
+# ---- Ingress NGINX
+- name: Install ingress-nginx
   kubernetes.core.helm:
     name: ingress-nginx
     chart_ref: ingress-nginx/ingress-nginx
     release_namespace: ingress-nginx
+    create_namespace: true
+    wait: true
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
     values:
       controller:
         service:
           type: LoadBalancer
         metrics:
           enabled: true
-  environment:
-    KUBECONFIG: /home/dev/.kube/config
 
-- name: Install ArgoCD
+# ---- Argo CD
+- name: Install Argo CD
   kubernetes.core.helm:
     name: argocd
     chart_ref: argo/argo-cd
     release_namespace: argocd
+    create_namespace: true
+    wait: true
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
     values:
       server:
         service:
@@ -75,25 +152,29 @@
       configs:
         params:
           server.insecure: true
-  environment:
-    KUBECONFIG: /home/dev/.kube/config
 
-- name: Update ArgoCD admin password
-  kubernetes.core.k8s_exec:
+- name: Get Argo CD admin password (from secret)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: argocd-initial-admin-secret
     namespace: argocd
-    pod: "{{ argocd_pod.resources[0].metadata.name }}"
-    command: >
-      argocd admin initial-password -n argocd
-  vars:
-    argocd_pod: "{{ query('kubernetes.core.k8s', api_version='v1', kind='Pod', namespace='argocd', label_selector='app.kubernetes.io/name=argocd-server') }}"
-  environment:
-    KUBECONFIG: /home/dev/.kube/config
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+  register: argocd_secret
 
+- name: Show Argo CD admin password
+  debug:
+    msg: "{{ (argocd_secret.resources[0].data.password | b64decode) | default('not found') }}"
+
+# ---- Portainer
 - name: Install Portainer
   kubernetes.core.helm:
     name: portainer
     chart_ref: portainer/portainer
     release_namespace: portainer
+    create_namespace: true
+    wait: true
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
     values:
       service:
         type: ClusterIP
@@ -109,14 +190,16 @@
           - secretName: portainer-tls
             hosts:
               - "portainer.{{ ansible_default_ipv4.address }}.nip.io"
-  environment:
-    KUBECONFIG: /home/dev/.kube/config
 
+# ---- kube-prometheus-stack
 - name: Install kube-prometheus-stack
   kubernetes.core.helm:
     name: kube-prometheus-stack
     chart_ref: prometheus-community/kube-prometheus-stack
     release_namespace: monitoring
+    create_namespace: true
+    wait: true
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
     values:
       grafana:
         adminPassword: "{{ grafana_admin_password }}"
@@ -139,14 +222,16 @@
           ingressClassName: nginx
           hosts:
             - "prometheus.{{ ansible_default_ipv4.address }}.nip.io"
-  environment:
-    KUBECONFIG: /home/dev/.kube/config
 
+# ---- Loki stack
 - name: Install Loki stack
   kubernetes.core.helm:
     name: loki-stack
     chart_ref: grafana/loki-stack
     release_namespace: logging
+    create_namespace: true
+    wait: true
+    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
     values:
       loki:
         persistence:
@@ -156,5 +241,3 @@
         enabled: true
       grafana:
         enabled: false
-  environment:
-    KUBECONFIG: /home/dev/.kube/config

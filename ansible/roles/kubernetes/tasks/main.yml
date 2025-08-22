@@ -1,31 +1,48 @@
 ---
-- name: Add Kubernetes GPG key
-  apt_key:
-    url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
-    state: present
-
-- name: Add Kubernetes repository
-  apt_repository:
-    repo: "deb https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
-    state: present
-
-- name: Install Kubernetes packages
+- name: Prereqs
   apt:
-    name:
-      - kubelet={{ kubelet_version }}
-      - kubeadm={{ kubeadm_version }}
-      - kubectl={{ kubectl_version }}
+    name: [ca-certificates, curl, gpg]
     state: present
     update_cache: yes
 
+- name: Ensure keyrings dir
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Add Kubernetes APT key (v1.33)
+  command: >
+    bash -lc 'curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key
+    | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg'
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add Kubernetes APT repo (v1.33)
+  copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    mode: "0644"
+    content: |
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /
+
+# Unhold -> upgrade/install latest patch from v1.33 -> hold again
+- name: Unhold kube packages (idempotent)
+  command: apt-mark unhold kubelet kubeadm kubectl
+  register: unhold_result
+  changed_when: "'Canceled hold' in unhold_result.stdout or 'was already not hold' in unhold_result.stdout"
+  failed_when: false
+
+- name: Install/upgrade kubelet/kubeadm/kubectl (latest v1.33.x)
+  apt:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: latest
+    update_cache: yes
+
 - name: Hold Kubernetes packages
-  dpkg_selections:
-    name: "{{ item }}"
-    selection: hold
-  loop:
-    - kubelet
-    - kubeadm
-    - kubectl
+  command: apt-mark hold kubelet kubeadm kubectl
 
 - name: Enable and start kubelet
   systemd:
