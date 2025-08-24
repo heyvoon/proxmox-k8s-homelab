@@ -1,0 +1,10 @@
+metallb_enabled: true
+metallb_namespace: metallb-system
+metallb_pool_name: default-pool
+
+# preferred
+metallb_addresses: []         # e.g. ["192.168.1.240-192.168.1.250"]
+
+# back-compat accepted by tasks below
+metallb_pool_cidr: ""
+# metallb_ip_range may exist in group_vars; we’ll pick it up in tasks

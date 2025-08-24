@@ -1,28 +1,33 @@
 ---
-- name: Deploy Kubernetes Cluster
+- name: Prepare nodes
   hosts: all
-  become: yes
-  gather_facts: yes
+  become: true
   roles:
     - common
     - containerd
-    - kubernetes
 
-- name: Initialize Kubernetes Control Plane
-  hosts: masters
-  become: yes
+- name: Bootstrap control plane
+  hosts: k8s_control_plane
+  become: true
   roles:
     - control-plane
 
-- name: Join Worker Nodes
-  hosts: workers
-  become: yes
+- name: Join workers
+  hosts: k8s_workers
+  become: true
   roles:
     - worker-nodes
 
-- name: Deploy CNI and Applications
-  hosts: masters
-  become: no
+- name: Install CNI & MetalLB
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
   roles:
     - cni
+
+- name: Post-install apps (optional)
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+  roles:
     - applications

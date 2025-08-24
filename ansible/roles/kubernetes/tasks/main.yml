@@ -44,6 +44,29 @@
 - name: Hold Kubernetes packages
   command: apt-mark hold kubelet kubeadm kubectl
 
+- name: Gather installed packages
+  package_facts:
+    manager: apt
+
+- name: Ensure kubelet drop-in dir
+  file:
+    path: /etc/systemd/system/kubelet.service.d
+    state: directory
+    mode: "0755"
+  when: "'kubelet' in ansible_facts.packages"
+
+- name: Set kubelet CRI socket
+  copy:
+    dest: /etc/systemd/system/kubelet.service.d/20-cri.conf
+    mode: "0644"
+    content: |
+      [Service]
+      Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock"
+  when: "'kubelet' in ansible_facts.packages"
+  notify:
+    - daemon-reload
+    - restart kubelet
+
 - name: Enable and start kubelet
   systemd:
     name: kubelet

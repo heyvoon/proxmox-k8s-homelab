@@ -1,243 +1,328 @@
 ---
-# Defaults:
-#   helm_version: "3.18.5"
-#   kubeconfig_path: "/etc/kubernetes/admin.conf"
-#   metallb_pool_cidr: "192.168.1.240-192.168.1.250"
-#   grafana_admin_password: "changeme"
-
-- name: "Download Helm v{{ helm_version }}"
-  get_url:
-    url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
-    dest: /tmp/helm.tar.gz
-    mode: "0644"
+# 0) Pull kubeconfig from the first control-plane (remote)
+- name: Slurp /etc/kubernetes/admin.conf from control-plane
+  slurp:
+    src: /etc/kubernetes/admin.conf
+  register: adminconf
+  delegate_to: "{{ groups['masters'][0] }}"
   become: true
+  run_once: true
 
-- name: Extract Helm
-  unarchive:
-    src: /tmp/helm.tar.gz
-    dest: /tmp
-    remote_src: true
-  become: true
+# 1) Prepare local kubeconfig on the controller
+- name: Ensure local .kube exists beside the playbook
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/.kube"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  run_once: true
 
-- name: Install Helm binary
-  copy:
-    src: /tmp/linux-amd64/helm
-    dest: /usr/local/bin/helm
-    mode: "0755"
-    remote_src: true
-  become: true
+- name: Write kubeconfig locally for modules
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/.kube/admin.conf"
+    content: "{{ adminconf.content | b64decode }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
 
-# ---- Add required Helm repositories
-- name: Add Cilium repo
-  kubernetes.core.helm_repository:
-    name: cilium
-    repo_url: https://helm.cilium.io/
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+- name: Set kubeconfig path fact
+  set_fact:
+    kubeconfig_local: "{{ playbook_dir }}/.kube/admin.conf"
+  delegate_to: localhost
+  run_once: true
 
-- name: Add ingress-nginx repo
-  kubernetes.core.helm_repository:
-    name: ingress-nginx
-    repo_url: https://kubernetes.github.io/ingress-nginx
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-  # docs: kubernetes.core.helm_repository supports kubeconfig param. :contentReference[oaicite:0]{index=0}
+# 2) Everything below runs on the controller (localhost) without sudo
+- name: Controller-local Helm setup and deployments
+  block:
 
-- name: Add Argo repo
-  kubernetes.core.helm_repository:
-    name: argo
-    repo_url: https://argoproj.github.io/argo-helm
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+    # 2.1) Install Helm locally (no sudo)
+    - name: Ensure local bin dir for helm
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/.bin"
+        state: directory
+        mode: "0755"
 
-- name: Add Portainer repo
-  kubernetes.core.helm_repository:
-    name: portainer
-    repo_url: https://portainer.github.io/k8s/
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+    - name: Download Helm v{{ helm_version }}
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+        dest: /tmp/helm.tar.gz
+        mode: "0644"
 
-- name: Add Prometheus Community repo
-  kubernetes.core.helm_repository:
-    name: prometheus-community
-    repo_url: https://prometheus-community.github.io/helm-charts
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+    - name: Extract Helm
+      ansible.builtin.unarchive:
+        src: /tmp/helm.tar.gz
+        dest: /tmp
+        remote_src: true
 
-- name: Add Grafana repo
-  kubernetes.core.helm_repository:
-    name: grafana
-    repo_url: https://grafana.github.io/helm-charts
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
+    - name: Install Helm binary into project bin (no sudo)
+      ansible.builtin.copy:
+        src: /tmp/linux-amd64/helm
+        dest: "{{ playbook_dir }}/.bin/helm"
+        mode: "0755"
+        remote_src: true
 
-- name: Add MetalLB repo
-  kubernetes.core.helm_repository:
-    name: metallb
-    repo_url: https://metallb.github.io/metallb
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-  # MetalLB official repo / install method. :contentReference[oaicite:1]{index=1}
+    - name: Set helm binary path fact
+      set_fact:
+        helm_bin: "{{ playbook_dir }}/.bin/helm"
 
-# ---- MetalLB (install before CRs)
-- name: Install MetalLB
-  kubernetes.core.helm:
-    name: metallb
-    chart_ref: metallb/metallb
-    release_namespace: metallb-system
-    create_namespace: true
-    wait: true
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-  # Helm module also supports kubeconfig param. :contentReference[oaicite:2]{index=2}
+    # 2.2) Wait for API readiness
+    # Ensure the Python Kubernetes client is present on the controller
+    - name: Install Python 'kubernetes' client on controller (using the same interpreter as ansible-playbook)
+      command: >
+        {{ ansible_playbook_python }} -m pip install --user --upgrade
+        "kubernetes>=27.0.0" "pyyaml>=6.0.1" "requests>=2.31.0"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      environment:
+        PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        PIP_ROOT_USER_ACTION: "ignore"
 
-- name: Configure MetalLB IPAddressPool
-  kubernetes.core.k8s:
-    state: present
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-    definition:
-      apiVersion: metallb.io/v1beta1
-      kind: IPAddressPool
-      metadata:
-        name: default-pool
+    # Make delegated localhost tasks use the same python
+    - name: Pin localhost interpreter to ansible_playbook_python
+      set_fact:
+        _noop: true
+      delegate_to: localhost
+      run_once: true
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+    - name: Wait for Kubernetes API
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: kube-system
+        kubeconfig: "{{ kubeconfig_local }}"
+      register: ks
+      retries: 30
+      delay: 5
+      until: ks.resources is not none
+
+    # 2.3) Add Helm repositories (force update = refresh indices)
+    - name: Add Helm repos
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+        kubeconfig: "{{ kubeconfig_local }}"
+        force_update: true
+        binary_path: "{{ helm_bin }}"
+      loop:
+        - { name: ingress-nginx,         url: https://kubernetes.github.io/ingress-nginx }
+        - { name: argo,                  url: https://argoproj.github.io/argo-helm }
+        - { name: portainer,             url: https://portainer.github.io/k8s/ }
+        - { name: prometheus-community,  url: https://prometheus-community.github.io/helm-charts }
+        - { name: grafana,               url: https://grafana.github.io/helm-charts }
+        - { name: metallb,               url: https://metallb.github.io/metallb }
+        - { name: cilium,                url: https://helm.cilium.io/ }
+      delegate_to: localhost
+      run_once: true
+
+    # 2.4) MetalLB (install chart, then CRs)
+# Ensure MetalLB is installed (helm or manifests) BEFORE these tasks
+
+    - name: Add Cilium repo
+      kubernetes.core.helm_repository:
+        name: cilium
+        repo_url: https://helm.cilium.io
+
+    - name: Install/upgrade Cilium
+      kubernetes.core.helm:
+        name: cilium
+        chart_ref: cilium/cilium
+        release_namespace: kube-system
+        create_namespace: false
+        update_repo_cache: true
+        wait: true
+        timeout: 600
+        values: "{{ cilium_values }}"
+      delegate_to: localhost
+
+    - name: Resolve MetalLB address list (accept list, cidr, or range)
+      set_fact:
+        _metallb_addresses: >-
+          {{
+            (metallb_addresses if (metallb_addresses | default([])) | length > 0 else [])
+            + ([metallb_pool_cidr] if (metallb_pool_cidr | default('')) | length > 0 else [])
+            + ([metallb_ip_range] if (metallb_ip_range is defined and metallb_ip_range | length > 0) else [])
+          }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Validate MetalLB address list
+      assert:
+        that: _metallb_addresses | length > 0
+        fail_msg: "Provide metallb_addresses (list) or metallb_pool_cidr/metallb_ip_range (string)."
+      delegate_to: localhost
+      run_once: true
+
+    - name: Configure MetalLB IPAddressPool
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: "{{ metallb_pool_name }}"
+            namespace: "{{ metallb_namespace }}"
+          spec:
+            addresses: "{{ _metallb_addresses }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Configure MetalLB L2Advertisement
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: "{{ metallb_pool_name }}"
+            namespace: "{{ metallb_namespace }}"
+          spec:
+            ipAddressPools: ["{{ metallb_pool_name }}"]
+      delegate_to: localhost
+      run_once: true
+
+    # Explicitly wait for controller & speaker to be Ready
+    - name: Wait for MetalLB controller and speaker pods to be Ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
         namespace: metallb-system
-      spec:
-        addresses:
-          - "{{ metallb_pool_cidr }}"
-  # kubernetes.core.k8s supports kubeconfig param. :contentReference[oaicite:3]{index=3}
+        label_selectors:
+          - "app.kubernetes.io/name in (metallb,controller,speaker)"
+      register: mlb_pods
+      retries: 30
+      delay: 10
+      until: >
+        (mlb_pods.resources | selectattr('status.phase','equalto','Running') | list | length) >= 2 and
+        (mlb_pods.resources | map(attribute='status.containerStatuses') | list
+          | map('selectattr','ready') | list) is not none
+      delegate_to: localhost
+      run_once: true
 
-- name: Configure MetalLB L2Advertisement
-  kubernetes.core.k8s:
-    state: present
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-    definition:
-      apiVersion: metallb.io/v1beta1
-      kind: L2Advertisement
-      metadata:
-        name: default-l2advertisement
-        namespace: metallb-system
-      spec:
-        ipAddressPools: [default-pool]
+    # 2.5) Ingress-NGINX
+    - name: Install ingress-nginx
+      kubernetes.core.helm:
+        name: ingress-nginx
+        chart_ref: ingress-nginx/ingress-nginx
+        release_namespace: ingress-nginx
+        create_namespace: true
+        wait: true
+        kubeconfig: "{{ kubeconfig_local }}"
+        binary_path: "{{ helm_bin }}"
+        values:
+          controller:
+            service: { type: LoadBalancer }
+            metrics: { enabled: true }
+      delegate_to: localhost
+      run_once: true
 
-# ---- Ingress NGINX
-- name: Install ingress-nginx
-  kubernetes.core.helm:
-    name: ingress-nginx
-    chart_ref: ingress-nginx/ingress-nginx
-    release_namespace: ingress-nginx
-    create_namespace: true
-    wait: true
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-    values:
-      controller:
-        service:
-          type: LoadBalancer
-        metrics:
-          enabled: true
 
-# ---- Argo CD
-- name: Install Argo CD
-  kubernetes.core.helm:
-    name: argocd
-    chart_ref: argo/argo-cd
-    release_namespace: argocd
-    create_namespace: true
-    wait: true
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-    values:
-      server:
-        service:
-          type: ClusterIP
-        ingress:
-          enabled: true
-          ingressClassName: nginx
-          hosts:
-            - "argocd.{{ ansible_default_ipv4.address }}.nip.io"
-          tls:
-            - secretName: argocd-server-tls
-              hosts:
-                - "argocd.{{ ansible_default_ipv4.address }}.nip.io"
-      configs:
-        params:
-          server.insecure: true
+    # 2.6) Argo CD
+    - name: Install Argo CD
+      kubernetes.core.helm:
+        name: argocd
+        chart_ref: argo/argo-cd
+        release_namespace: argocd
+        create_namespace: true
+        wait: true
+        kubeconfig: "{{ kubeconfig_local }}"
+        binary_path: "{{ helm_bin }}"
+        values:
+          server:
+            service: { type: ClusterIP }
+            ingress:
+              enabled: true
+              ingressClassName: nginx
+              hosts: [ "argocd.{{ hostvars[groups['masters'][0]].ansible_default_ipv4.address }}.nip.io" ]
+              tls:
+                - secretName: argocd-server-tls
+                  hosts: [ "argocd.{{ hostvars[groups['masters'][0]].ansible_default_ipv4.address }}.nip.io" ]
+          configs:
+            params: { server.insecure: true }
 
-- name: Get Argo CD admin password (from secret)
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: Secret
-    name: argocd-initial-admin-secret
-    namespace: argocd
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-  register: argocd_secret
+    - name: Show Argo CD admin password
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: argocd-initial-admin-secret
+        namespace: argocd
+        kubeconfig: "{{ kubeconfig_local }}"
+      register: argocd_secret
 
-- name: Show Argo CD admin password
-  debug:
-    msg: "{{ (argocd_secret.resources[0].data.password | b64decode) | default('not found') }}"
+    - name: Argo CD admin password (decoded)
+      debug:
+        msg: "{{ (argocd_secret.resources[0].data.password | b64decode) | default('not found') }}"
 
-# ---- Portainer
-- name: Install Portainer
-  kubernetes.core.helm:
-    name: portainer
-    chart_ref: portainer/portainer
-    release_namespace: portainer
-    create_namespace: true
-    wait: true
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-    values:
-      service:
-        type: ClusterIP
-      ingress:
-        enabled: true
-        ingressClassName: nginx
-        hosts:
-          - host: "portainer.{{ ansible_default_ipv4.address }}.nip.io"
-            paths:
-              - path: /
-                pathType: Prefix
-        tls:
-          - secretName: portainer-tls
+    # 2.7) Portainer
+    - name: Install Portainer
+      kubernetes.core.helm:
+        name: portainer
+        chart_ref: portainer/portainer
+        release_namespace: portainer
+        create_namespace: true
+        wait: true
+        kubeconfig: "{{ kubeconfig_local }}"
+        binary_path: "{{ helm_bin }}"
+        values:
+          service: { type: ClusterIP }
+          ingress:
+            enabled: true
+            ingressClassName: nginx
             hosts:
-              - "portainer.{{ ansible_default_ipv4.address }}.nip.io"
+              - host: "portainer.{{ hostvars[groups['masters'][0]].ansible_default_ipv4.address }}.nip.io"
+                paths: [ { path: "/", pathType: Prefix } ]
+            tls:
+              - secretName: portainer-tls
+                hosts: [ "portainer.{{ hostvars[groups['masters'][0]].ansible_default_ipv4.address }}.nip.io" ]
 
-# ---- kube-prometheus-stack
-- name: Install kube-prometheus-stack
-  kubernetes.core.helm:
-    name: kube-prometheus-stack
-    chart_ref: prometheus-community/kube-prometheus-stack
-    release_namespace: monitoring
-    create_namespace: true
-    wait: true
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-    values:
-      grafana:
-        adminPassword: "{{ grafana_admin_password }}"
-        service:
-          type: ClusterIP
-        ingress:
-          enabled: true
-          ingressClassName: nginx
-          hosts:
-            - "grafana.{{ ansible_default_ipv4.address }}.nip.io"
-          tls:
-            - secretName: grafana-tls
-              hosts:
-                - "grafana.{{ ansible_default_ipv4.address }}.nip.io"
-      prometheus:
-        service:
-          type: ClusterIP
-        ingress:
-          enabled: true
-          ingressClassName: nginx
-          hosts:
-            - "prometheus.{{ ansible_default_ipv4.address }}.nip.io"
+    # 2.8) kube-prometheus-stack
+    - name: Install kube-prometheus-stack
+      kubernetes.core.helm:
+        name: kube-prometheus-stack
+        chart_ref: prometheus-community/kube-prometheus-stack
+        release_namespace: monitoring
+        create_namespace: true
+        wait: true
+        kubeconfig: "{{ kubeconfig_local }}"
+        binary_path: "{{ helm_bin }}"
+        values:
+          grafana:
+            adminPassword: "{{ grafana_admin_password }}"
+            service: { type: ClusterIP }
+            ingress:
+              enabled: true
+              ingressClassName: nginx
+              hosts: [ "grafana.{{ hostvars[groups['masters'][0]].ansible_default_ipv4.address }}.nip.io" ]
+              tls:
+                - secretName: grafana-tls
+                  hosts: [ "grafana.{{ hostvars[groups['masters'][0]].ansible_default_ipv4.address }}.nip.io" ]
+          prometheus:
+            service: { type: ClusterIP }
+            ingress:
+              enabled: true
+              ingressClassName: nginx
+              hosts: [ "prometheus.{{ hostvars[groups['masters'][0]].ansible_default_ipv4.address }}.nip.io" ]
 
-# ---- Loki stack
-- name: Install Loki stack
-  kubernetes.core.helm:
-    name: loki-stack
-    chart_ref: grafana/loki-stack
-    release_namespace: logging
-    create_namespace: true
-    wait: true
-    kubeconfig: "{{ kubeconfig_path | default('/etc/kubernetes/admin.conf') }}"
-    values:
-      loki:
-        persistence:
-          enabled: true
-          size: 10Gi
-      promtail:
-        enabled: true
-      grafana:
-        enabled: false
+    # 2.9) Loki stack
+    - name: Install Loki stack
+      kubernetes.core.helm:
+        name: loki-stack
+        chart_ref: grafana/loki-stack
+        release_namespace: logging
+        create_namespace: true
+        wait: true
+        kubeconfig: "{{ kubeconfig_local }}"
+        binary_path: "{{ helm_bin }}"
+        values:
+          loki:
+            persistence: { enabled: true, size: 10Gi }
+          promtail: { enabled: true }
+          grafana: { enabled: false }
+
+  delegate_to: localhost
+  become: false
+  run_once: true

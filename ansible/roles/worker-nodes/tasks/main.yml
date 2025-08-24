@@ -4,13 +4,16 @@
     path: /etc/kubernetes/kubelet.conf
   register: node_joined
 
-- name: Read join command from file
-  local_action:
-    module: slurp
-    src: "./join_command.txt"
-  register: join_command_content
-  when: not node_joined.stat.exists
+# Use the join command that the control-plane role exposed as a host fact
+# (see: hostvars access pattern and kubeadm join docs)
+# https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-join/
+# https://docs.ansible.com/ansible/latest/playbook_guide/playbooks_delegation.html
+# https://www.redhat.com/en/blog/hostvars-magic-variable-ansible
 
-- name: Join worker node to cluster
-  command: "{{ join_command_content.content | b64decode | trim }}"
-  when: not node_joined.stat.exists and join_command_content.content is defined
+- name: Join worker node to cluster (containerd)
+  command: >
+    {{ hostvars[groups['masters'][0]].kube_join_cmd }}
+    --cri-socket=unix:///run/containerd/containerd.sock
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+  when: not node_joined.stat.exists

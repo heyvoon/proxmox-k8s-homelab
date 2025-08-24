@@ -1,0 +1,16 @@
+# restart containerd normally
+- name: restart containerd
+  ansible.builtin.service:
+    name: containerd
+    state: restarted
+    enabled: true
+
+# only restart kubelet if it exists (later plays will install it)
+- name: restart kubelet if present
+  ansible.builtin.service:
+    name: kubelet
+    state: restarted
+  when:
+    - ansible_service_mgr == 'systemd'
+    - ansible_facts.services is defined
+    - "'kubelet.service' in ansible_facts.services"

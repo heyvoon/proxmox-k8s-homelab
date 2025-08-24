@@ -268,33 +268,78 @@ resource "null_resource" "deploy_kubernetes" {
   ]
 }
 
-# IMPROVED: Better cluster validation
+# IMPROVED: Resilient cluster validation with retries and kubeconfig fallback
 resource "null_resource" "validate_cluster" {
   provisioner "local-exec" {
     working_dir = "${path.module}/ansible"
     command = <<-EOT
+      set -euo pipefail
+
       echo "Validating Kubernetes cluster..."
-      
-      # Wait a bit for cluster to stabilize
-      sleep 30
-      
-      # Check cluster status
+
+      CP_IP="${var.control_plane.ip}"
+      SSH_KEY="${var.ssh_private_key_path}"
+      SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${var.ssh_private_key_path}"
+      REMOTE="dev@${var.control_plane.ip}"
+
+      # Remove stale host key (CP may have been rebuilt)
+      ssh-keygen -R "${var.control_plane.ip}" >/dev/null 2>&1 || true
+
+      # Small initial settle time
+      sleep 15
+
+      # Helper: run kubectl remotely with sane fallbacks
+      rk() {
+        ssh $SSH_OPTS $REMOTE "kubectl \"\$@\" 2>/dev/null || sudo -E /usr/bin/kubectl --kubeconfig /etc/kubernetes/admin.conf \"\$@\""
+      }
+
+      echo "Waiting for API server to respond and nodes to register..."
+      # Try up to ~5 minutes (30 * 10s)
+      ATTEMPTS=30
+      i=0
+      until rk get nodes -o wide >/dev/null 2>&1; do
+        i=$((i+1))
+        if [ "$i" -ge "$ATTEMPTS" ]; then
+          echo "ERROR: API not responding to kubectl on control plane."
+          echo "Diagnostics:"
+          ssh $SSH_OPTS $REMOTE 'systemctl --no-pager --full status kubelet || true'
+          ssh $SSH_OPTS $REMOTE 'sudo journalctl -u kubelet --no-pager -n 100 || true'
+          exit 1
+        fi
+        sleep 10
+      done
+
       echo "Checking cluster nodes..."
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${var.ssh_private_key_path} dev@${var.control_plane.ip} 'kubectl get nodes -o wide'
-      
-      if [ $? -ne 0 ]; then
-        echo "ERROR: Failed to get cluster nodes"
-        exit 1
-      fi
-      
-      echo "Checking cluster pods..."
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${var.ssh_private_key_path} dev@${var.control_plane.ip} 'kubectl get pods -A'
-      
+      rk get nodes -o wide
+
+      echo "Waiting for all nodes to be Ready..."
+      READY_ATTEMPTS=30
+      j=0
+      until rk get nodes --no-headers | awk '{print $2}' | grep -qE '(^|,)Ready(,|$)'; do
+        j=$((j+1))
+        if [ "$j" -ge "$READY_ATTEMPTS" ]; then
+          echo "ERROR: Nodes not Ready within timeout."
+          rk get nodes -o wide || true
+          rk get pods -A -o wide || true
+          exit 1
+        fi
+        sleep 10
+      done
+
+      echo "Checking control-plane components..."
+      rk get pods -n kube-system -o wide
+
       echo "Checking cluster info..."
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${var.ssh_private_key_path} dev@${var.control_plane.ip} 'kubectl cluster-info'
-      
+      rk cluster-info
+
       echo "Cluster validation completed!"
     EOT
+  }
+
+  # If you want this to re-run on each apply when CP IP or SSH key changes:
+  triggers = {
+    cp_ip  = var.control_plane.ip
+    sshkey = var.ssh_private_key_path
   }
 
   depends_on = [null_resource.deploy_kubernetes]
